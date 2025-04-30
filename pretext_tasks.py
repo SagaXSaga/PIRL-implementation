@@ -2,6 +2,7 @@ import torch
 import torchvision
 import torchvision.transforms as transforms
 import torchvision.transforms.functional as F
+from torchvision.transforms.functional import to_pil_image, to_tensor
 from torchvision.transforms import ToTensor
 from PIL import Image
 import matplotlib.pyplot as plt
@@ -12,8 +13,8 @@ class Mirror_Detection(object):
         self.flip_prob = flip_prob
         self.return_image = return_image
 
-    def __call__(self, img):
-        if torch.rand(1).item() < self.flip_prob:
+    def __call__(self, img, alwaysFlip = False):
+        if alwaysFlip or (torch.rand(1).item() < self.flip_prob):
             flipped = F.vflip(img)
             label = 1  # flipped
         else:
@@ -36,45 +37,99 @@ class Grayscale_Colorization(object):
         self.return_image = return_image
 
     def __call__(self, img):
-        grayscale_img = F.to_grayscale(img, num_output_channels=self.num_output_channels)
+        # Convert tensor to PIL Image
+        img = F.to_pil_image(img)
+        
+        # Convert to grayscale (if not already grayscale) and expand channels to match input
+        grayscale_img = F.rgb_to_grayscale(img, num_output_channels=self.num_output_channels)
+        
+        # Convert back to tensor if needed
+        grayscale_img = F.to_tensor(grayscale_img)
         if self.return_image:
             return img, grayscale_img
         return grayscale_img
 
-class Rotate_Jigsaw(object):
-    def __init__(self, n_patches=(3, 3), num_rotations=4, return_info=False):
-        """
-        n_patches: Tuple indicating the grid size for jigsaw (e.g., 3x3).
-        num_rotations: Number of discrete rotations (default is 4 for 0°, 90°, 180°, 270°).
-        return_info: If True, also returns the rotation label and jigsaw permutation index.
-        """
-        self.n_patches = n_patches
-        self.degrees = torch.arange(num_rotations) * (360.0 / num_rotations)
-        self.return_info = return_info
+class Grayscale_Colorization_Batch(object):
+    def __init__(self, return_image=False):
+        self.return_image = return_image
+
+    def __call__(self, img_batch):
+        # img_batch: (B, 3, H, W)
+        r, g, b = img_batch[:, 0], img_batch[:, 1], img_batch[:, 2]
+        gray = 0.2989 * r + 0.5870 * g + 0.1140 * b  # (B, H, W)
+        gray = gray.unsqueeze(1).repeat(1, 3, 1, 1)  # (B, 3, H, W) to match input channels
+
+        if self.return_image:
+            return img_batch, gray
+        return gray
+
+class Rotate(object):
+    def __init__(self, return_image=False):
+        self.angles = [0, 90, 180, 270]
+        self.return_image = return_image
 
     def __call__(self, img):
-        assert isinstance(img, torch.Tensor), "Input should be a torch.Tensor (e.g., from ToTensor())"
+        label = torch.randint(0, 4, (1,)).item()
+        rotated_img = F.rotate(img, self.angles[label])
+        if self.return_image:
+            return img, rotated_img
+        return rotated_img, self.angles[label]
 
-        # Ensure img is 4D (batch_size, C, H, W)
-        if img.dim() == 3:
-            img = img.unsqueeze(0)  # Add batch dimension if it's a single image
+class Jigsaw(object):
+    def __init__(self, grid_size=2, permutations=None, return_image=False):
+        self.grid_size = grid_size
+        self.return_image = return_image
+        self.permutations = permutations if permutations is not None else [
+            [0, 1, 2, 3],
+            [1, 0, 3, 2],
+            [2, 3, 0, 1],
+            [3, 2, 1, 0],
+            [2, 0, 3, 1],
+        ]
 
-        # Rotation
-        rot_label = torch.randint(len(self.degrees), (1,)).item()
-        rotated_img = F.rotate(img, angle=self.degrees[rot_label].item())
+    def __call__(self, img):
+        # Convert tensor to PIL if needed
+        if isinstance(img, torch.Tensor):
+            img = to_pil_image(img)
 
-        # Jigsaw
-        patch_size_1 = rotated_img.size(1) // self.n_patches[0]  # Height of each patch
-        patch_size_2 = rotated_img.size(2) // self.n_patches[1]  # Width of each patch
+        w, h = img.size
+        tile_w, tile_h = w // self.grid_size, h // self.grid_size
 
-        patches = rotated_img.unfold(1, patch_size_1, patch_size_1).unfold(2, patch_size_2, patch_size_2)
-        patches = patches.permute(0, 2, 3, 1, 4, 5).contiguous()  # Corrected permute
-        patches = patches.view(-1, patches.shape[3], patches.shape[4], patches.shape[5])  # (num_patches, C, H, W)
+        # Extract tiles
+        tiles = []
+        for i in range(self.grid_size):
+            for j in range(self.grid_size):
+                left = j * tile_w
+                upper = i * tile_h
+                tile = img.crop((left, upper, left + tile_w, upper + tile_h))
+                tiles.append(tile)
 
-        rand_perm = torch.randperm(patches.shape[0])
-        shuffled_patches = patches[rand_perm]
+        # Apply random permutation
+        perm_index = torch.randint(0, len(self.permutations), (1,)).item()
+        perm = self.permutations[perm_index]
+        shuffled_tiles = [tiles[i] for i in perm]
 
-        # Optional: return additional info
-        if self.return_info:
-            return img, shuffled_patches, rot_label, rand_perm
-        return img, shuffled_patches
+        # Reconstruct image
+        new_img = Image.new('RGB', (w, h))
+        for idx, tile in enumerate(shuffled_tiles):
+            i, j = divmod(idx, self.grid_size)
+            new_img.paste(tile, (j * tile_w, i * tile_h))
+
+        if self.return_image:
+            return to_tensor(img), to_tensor(new_img)
+        return to_tensor(new_img), perm_index
+    
+class Jigsaw_Batch(object):
+    def __init__(self, grid_size=2, permutations=None, return_image=False):
+        self.jigsaw = Jigsaw(grid_size=grid_size,
+                             permutations=permutations,
+                             return_image=return_image)
+
+    def __call__(self, batch):
+        origs, shuffled = [], []
+        for img in batch:
+            o, s = self.jigsaw(img)        # apply single-image Jigsaw
+            origs.append(o)
+            shuffled.append(s)
+        # stack back into (B, C, H, W) tensors
+        return torch.stack(origs), torch.stack(shuffled)

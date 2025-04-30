@@ -15,6 +15,7 @@ class PIRL(nn.Module):
         super(PIRL, self).__init__()
         self.model = self.Model(encoding_size=encoding_size, pretrained=pretrained)
         self.loss = self.Loss(loss_lambda=loss_lambda)
+        self.contrastiveloss = self.ContrastiveLoss(loss_lambda=loss_lambda)
 
     def forward(self, x, transformed_x=None):
         """
@@ -68,6 +69,27 @@ class PIRL(nn.Module):
             loss2 = F.cross_entropy(transformed_output, target)
             total_loss = self.loss_lambda * loss1 + (1 - self.loss_lambda) * loss2
             return total_loss
+    class ContrastiveLoss(nn.Module):
+        def __init__(self, temperature=0.5, loss_lambda=0.8):
+            super().__init__()
+            self.temperature = temperature
+
+        def forward(self, z_i, z_j):  # z_i: original, z_j: transformed
+            N = z_i.size(0)
+            z = torch.cat([z_i, z_j], dim=0)  # 2N x D
+            sim = F.cosine_similarity(z.unsqueeze(1), z.unsqueeze(0), dim=2)  # 2N x 2N
+            sim /= self.temperature
+
+            labels = torch.cat([torch.arange(N) for _ in range(2)], dim=0)
+            labels = labels.to(z.device)
+
+            mask = torch.eye(2*N, dtype=torch.bool).to(z.device)
+            sim.masked_fill_(mask, -float('inf'))  # exclude self-comparisons
+
+            positives = torch.cat([torch.diag(sim, N), torch.diag(sim, -N)], dim=0)
+
+            loss = -torch.log(torch.exp(positives) / torch.exp(sim).sum(dim=1))
+            return loss.mean()
 
 
 
