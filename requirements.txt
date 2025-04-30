@@ -1,0 +1,2 @@
+Run main on google colab.
+Download functions.py and pretext_tasks.py and upload them in first section of main.
